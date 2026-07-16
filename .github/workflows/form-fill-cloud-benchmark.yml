@@ -1,0 +1,120 @@
+# Dispatch-only; requires the repository secret SKYVERN_CLOUD_API_KEY; browsers run in remote Skyvern cloud sessions (no local browser); runs never submit forms.
+name: Form-fill cloud benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      cases_file:
+        description: Benchmark cases file
+        type: string
+        default: benchmarks/form_fill/cases/smoke_nav.json
+      backends:
+        description: Space-separated backends to benchmark
+        type: string
+        default: rustwright playwright
+      reps:
+        description: Repetitions per case and backend
+        type: string
+        default: "2"
+      concurrency:
+        description: Maximum concurrent benchmark cases
+        type: string
+        default: "4"
+      runner_label:
+        description: Runner label
+        type: choice
+        default: blacksmith-8vcpu-ubuntu-2404
+        options:
+          - blacksmith-8vcpu-ubuntu-2404
+          - blacksmith-4vcpu-ubuntu-2404
+          - ubuntu-latest
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    name: Rustwright and Playwright cloud benchmark
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # The job never pushes; do not leave the job token in git config
+          # for later steps that execute repository build code.
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+
+      - name: Build rustwright in its benchmark environment
+        run: |
+          python -m venv .venv-rw
+          # Exact pins keep the third-party dependency chain deterministic.
+          # The repository's own Rust build code necessarily executes here;
+          # that code is what this workflow exists to benchmark and is
+          # reviewed through normal PR review.
+          .venv-rw/bin/pip install maturin==1.14.1 psutil==7.2.2
+          # maturin locates the target venv via VIRTUAL_ENV; invoking its binary
+          # from .venv-rw/bin does not set it, and the venv is not named ".venv".
+          VIRTUAL_ENV="$PWD/.venv-rw" .venv-rw/bin/maturin develop --release
+
+      - name: Install reference Playwright in its benchmark environment
+        run: |
+          python -m venv .venv-pw
+          .venv-pw/bin/pip install playwright==1.59.0 psutil==7.2.2
+
+      - name: Run form-fill cloud benchmark suite
+        env:
+          SKYVERN_CLOUD_API_KEY: ${{ secrets.SKYVERN_CLOUD_API_KEY }}
+          SKYVERN_BASE_URL: https://api.skyvern.com
+          # Dispatch inputs are passed via env, never interpolated into the
+          # shell, so input text cannot inject commands. run_suite.py further
+          # constrains --backends to {rustwright, playwright}.
+          CASES_FILE: ${{ inputs.cases_file }}
+          BACKENDS: ${{ inputs.backends }}
+          REPS: ${{ inputs.reps }}
+          CONCURRENCY: ${{ inputs.concurrency }}
+        run: |
+          # Constrain BACKENDS before it is word-split below: env routing
+          # already prevents shell injection, and this rejects CLI-option
+          # smuggling (e.g. "rustwright --weakness") through the split.
+          case "$BACKENDS" in
+            (*[!a-z\ ]*) echo "invalid backends: must be space-separated lowercase words"; exit 1 ;;
+          esac
+          # shellcheck disable=SC2086  # BACKENDS is an intentional space-separated list
+          PYTHONPATH="$PWD/benchmarks/form_fill" \
+            .venv-rw/bin/python benchmarks/form_fill/harness/run_suite.py \
+            --cases "$CASES_FILE" \
+            --backends $BACKENDS \
+            --reps "$REPS" \
+            --concurrency "$CONCURRENCY" \
+            --python "rustwright=$PWD/.venv-rw/bin/python" "playwright=$PWD/.venv-pw/bin/python" \
+            --output out/suite
+
+      - name: Print benchmark summary
+        if: always()
+        run: |
+          if [ -f out/suite/suite_summary.txt ]; then
+            cat out/suite/suite_summary.txt
+          else
+            echo "No summary produced (benchmark aborted before writing output)."
+          fi
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: form-fill-cloud-benchmark
+          path: out/suite/
+          if-no-files-found: error
+          retention-days: 30
