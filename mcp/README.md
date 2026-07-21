@@ -4,6 +4,15 @@ Give any MCP client `browser_*` tools over stdio with no clone or browser downlo
 
 ## Install
 
+**Setting this up with an AI agent?** Tell your agent (Claude Code, Codex,
+Cursor, and others):
+
+> Fetch https://raw.githubusercontent.com/Skyvern-AI/rustwright/HEAD/mcp/AGENT_SETUP.md
+> and follow the instructions to set up the Rustwright MCP server.
+
+[AGENT_SETUP.md](AGENT_SETUP.md) contains agent-facing install steps for every
+major MCP client, a verification step, and troubleshooting.
+
 ### Claude Code
 
 ```bash
