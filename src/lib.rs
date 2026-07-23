@@ -1885,6 +1885,416 @@ mod tests {
 
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
+    enum ManifestDependencySection {
+        Other,
+        Dependencies,
+        Dependency(String),
+    }
+
+    fn exact_pins_in_manifest(manifest: &str) -> Vec<String> {
+        let mut section = ManifestDependencySection::Other;
+        let mut exact_pins = Vec::new();
+
+        for line in manifest.lines() {
+            let line = strip_toml_comment(line).trim();
+            if line.is_empty() {
+                continue;
+            }
+            if line.starts_with('[') {
+                section = manifest_dependency_section(line);
+                continue;
+            }
+
+            let Some((key, value)) = split_top_level_assignment(line) else {
+                continue;
+            };
+            match &section {
+                ManifestDependencySection::Dependencies => {
+                    if dependency_spec_is_exact_pin(value) {
+                        exact_pins.push(unquote_toml_key(key).to_string());
+                    }
+                }
+                ManifestDependencySection::Dependency(name) => {
+                    if unquote_toml_key(key) == "version" && quoted_spec_is_exact_pin(value) {
+                        exact_pins.push(name.clone());
+                    }
+                }
+                ManifestDependencySection::Other => {}
+            }
+        }
+
+        exact_pins
+    }
+
+    fn manifest_dependency_section(header: &str) -> ManifestDependencySection {
+        let Some(path) = toml_table_path(header) else {
+            return ManifestDependencySection::Other;
+        };
+        let is_dependency_family = |part: &str| {
+            matches!(
+                part,
+                "dependencies" | "dev-dependencies" | "build-dependencies"
+            )
+        };
+
+        if path.len() == 1 && is_dependency_family(&path[0]) {
+            return ManifestDependencySection::Dependencies;
+        }
+        if path.len() == 2 && is_dependency_family(&path[0]) {
+            return ManifestDependencySection::Dependency(path[1].clone());
+        }
+        if path.first().is_some_and(|part| part == "workspace") {
+            return match path.as_slice() {
+                [_, dependencies] if dependencies == "dependencies" => {
+                    ManifestDependencySection::Dependencies
+                }
+                [_, dependencies, name] if dependencies == "dependencies" => {
+                    ManifestDependencySection::Dependency(name.clone())
+                }
+                _ => ManifestDependencySection::Other,
+            };
+        }
+        if path.first().is_some_and(|part| part == "target") && path.len() >= 3 {
+            if path.last().is_some_and(|part| is_dependency_family(part)) {
+                return ManifestDependencySection::Dependencies;
+            }
+            if is_dependency_family(&path[path.len() - 2]) {
+                return ManifestDependencySection::Dependency(path.last().unwrap().clone());
+            }
+        }
+
+        ManifestDependencySection::Other
+    }
+
+    fn toml_table_path(header: &str) -> Option<Vec<String>> {
+        if header.starts_with("[[") {
+            return None;
+        }
+        let path = header.strip_prefix('[')?.strip_suffix(']')?;
+        let mut parts = Vec::new();
+        let mut start = 0;
+        let mut quote = None;
+        let mut escaped = false;
+
+        for (index, character) in path.char_indices() {
+            match quote {
+                Some('"') if escaped => escaped = false,
+                Some('"') if character == '\\' => escaped = true,
+                Some(active_quote) if character == active_quote => quote = None,
+                Some(_) => {}
+                None if matches!(character, '\'' | '"') => quote = Some(character),
+                None if character == '.' => {
+                    let part = unquote_toml_key(&path[start..index]);
+                    if part.is_empty() {
+                        return None;
+                    }
+                    parts.push(part.to_string());
+                    start = index + character.len_utf8();
+                }
+                None => {}
+            }
+        }
+        if quote.is_some() {
+            return None;
+        }
+        let part = unquote_toml_key(&path[start..]);
+        if part.is_empty() {
+            return None;
+        }
+        parts.push(part.to_string());
+        Some(parts)
+    }
+
+    fn strip_toml_comment(line: &str) -> &str {
+        let mut quote = None;
+        let mut escaped = false;
+
+        for (index, character) in line.char_indices() {
+            match quote {
+                Some('"') if escaped => escaped = false,
+                Some('"') if character == '\\' => escaped = true,
+                Some(active_quote) if character == active_quote => quote = None,
+                Some(_) => {}
+                None if matches!(character, '\'' | '"') => quote = Some(character),
+                None if character == '#' => return &line[..index],
+                None => {}
+            }
+        }
+
+        line
+    }
+
+    fn unquote_toml_key(key: &str) -> &str {
+        let key = key.trim();
+        if key.len() >= 2 {
+            let first = key.as_bytes()[0];
+            let last = key.as_bytes()[key.len() - 1];
+            if matches!(first, b'\'' | b'"') && first == last {
+                return &key[1..key.len() - 1];
+            }
+        }
+        key
+    }
+
+    fn split_top_level_assignment(line: &str) -> Option<(&str, &str)> {
+        let index = find_top_level_character(line, '=')?;
+        Some((&line[..index], &line[index + 1..]))
+    }
+
+    fn find_top_level_character(value: &str, wanted: char) -> Option<usize> {
+        let mut quote = None;
+        let mut escaped = false;
+        let mut braces = 0;
+        let mut brackets = 0;
+
+        for (index, character) in value.char_indices() {
+            match quote {
+                Some('"') if escaped => escaped = false,
+                Some('"') if character == '\\' => escaped = true,
+                Some(active_quote) if character == active_quote => quote = None,
+                Some(_) => {}
+                None if matches!(character, '\'' | '"') => quote = Some(character),
+                None if character == wanted && braces == 0 && brackets == 0 => {
+                    return Some(index);
+                }
+                None if character == '{' => braces += 1,
+                None if character == '}' => braces -= 1,
+                None if character == '[' => brackets += 1,
+                None if character == ']' => brackets -= 1,
+                None => {}
+            }
+        }
+
+        None
+    }
+
+    fn split_top_level_fields(value: &str) -> Vec<&str> {
+        let mut fields = Vec::new();
+        let mut start = 0;
+        let mut remainder = value;
+
+        while let Some(index) = find_top_level_character(remainder, ',') {
+            fields.push(&value[start..start + index]);
+            start += index + 1;
+            remainder = &value[start..];
+        }
+        fields.push(&value[start..]);
+        fields
+    }
+
+    fn dependency_spec_is_exact_pin(specification: &str) -> bool {
+        let specification = specification.trim();
+        if quoted_spec_is_exact_pin(specification) {
+            return true;
+        }
+
+        let Some(fields) = specification
+            .strip_prefix('{')
+            .and_then(|value| value.strip_suffix('}'))
+        else {
+            return false;
+        };
+        split_top_level_fields(fields).into_iter().any(|field| {
+            split_top_level_assignment(field).is_some_and(|(key, value)| {
+                unquote_toml_key(key) == "version" && quoted_spec_is_exact_pin(value)
+            })
+        })
+    }
+
+    fn quoted_spec_is_exact_pin(specification: &str) -> bool {
+        // This guard catches accidental exact pins in all reasonable TOML encodings;
+        // deliberate obfuscation is out of scope and should be caught during review.
+        normalize_toml_version_string(specification).is_some_and(|version| version.starts_with('='))
+    }
+
+    fn normalize_toml_version_string(specification: &str) -> Option<String> {
+        let specification = specification.trim();
+        let (contents, is_basic) = if let Some(contents) = specification
+            .strip_prefix("\"\"\"")
+            .and_then(|value| value.strip_suffix("\"\"\""))
+        {
+            (contents, true)
+        } else if let Some(contents) = specification
+            .strip_prefix("'''")
+            .and_then(|value| value.strip_suffix("'''"))
+        {
+            (contents, false)
+        } else if let Some(contents) = specification
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+        {
+            (contents, true)
+        } else if let Some(contents) = specification
+            .strip_prefix('\'')
+            .and_then(|value| value.strip_suffix('\''))
+        {
+            (contents, false)
+        } else {
+            return None;
+        };
+
+        if is_basic {
+            decode_toml_basic_string(contents)
+        } else {
+            Some(contents.to_string())
+        }
+    }
+
+    fn decode_toml_basic_string(contents: &str) -> Option<String> {
+        let mut decoded = String::with_capacity(contents.len());
+        let mut characters = contents.chars();
+
+        while let Some(character) = characters.next() {
+            if character != '\\' {
+                decoded.push(character);
+                continue;
+            }
+
+            match characters.next()? {
+                'b' => decoded.push('\u{0008}'),
+                't' => decoded.push('\t'),
+                'n' => decoded.push('\n'),
+                'f' => decoded.push('\u{000c}'),
+                'r' => decoded.push('\r'),
+                '"' => decoded.push('"'),
+                '\\' => decoded.push('\\'),
+                'u' => decoded.push(decode_toml_unicode_escape(&mut characters, 4)?),
+                'U' => decoded.push(decode_toml_unicode_escape(&mut characters, 8)?),
+                _ => return None,
+            }
+        }
+
+        Some(decoded)
+    }
+
+    fn decode_toml_unicode_escape(
+        characters: &mut impl Iterator<Item = char>,
+        digits: usize,
+    ) -> Option<char> {
+        let mut value = 0;
+        for _ in 0..digits {
+            value = value * 16 + characters.next()?.to_digit(16)?;
+        }
+        char::from_u32(value)
+    }
+
+    #[test]
+    fn manifest_dependencies_do_not_use_exact_version_pins() {
+        let mut exact_pins = Vec::new();
+
+        for (manifest_name, manifest) in [
+            ("Cargo.toml", include_str!("../Cargo.toml")),
+            (
+                "rust-native/Cargo.toml",
+                include_str!("../rust-native/Cargo.toml"),
+            ),
+        ] {
+            exact_pins.extend(
+                exact_pins_in_manifest(manifest)
+                    .into_iter()
+                    .map(|name| format!("{manifest_name}: {name}")),
+            );
+        }
+
+        assert!(
+            exact_pins.is_empty(),
+            "exact dependency version pins are not allowed: {}",
+            exact_pins.join(", ")
+        );
+    }
+
+    #[test]
+    fn exact_pins_in_manifest_finds_dependency_syntax_variants() {
+        let manifest = r#"
+[dependencies]
+plain-double = "=1.2.3"
+plain-single = '=1.2.3'
+inline-double = { version = "=1.2.3", features = ["serde"] }
+inline-single = { package = "renamed", version = '=1.2.3' }
+
+[package]
+name = "fixture"
+
+[dependencies.runtime-table]
+version = "=1"
+
+[dev-dependencies.test-table]
+version = '=2'
+
+[build-dependencies.build-table]
+version = "=3"
+
+[workspace.dependencies]
+workspace-inline = { version = '=4' }
+
+[workspace.dependencies.workspace-table]
+version = "=5"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+target-inline = { version = "=6" }
+
+[target.'cfg(target_os = "linux")'.dependencies.target-table]
+version = '=7'
+"#;
+
+        assert_eq!(
+            exact_pins_in_manifest(manifest),
+            [
+                "plain-double",
+                "plain-single",
+                "inline-double",
+                "inline-single",
+                "runtime-table",
+                "test-table",
+                "build-table",
+                "workspace-inline",
+                "workspace-table",
+                "target-inline",
+                "target-table",
+            ]
+        );
+    }
+
+    #[test]
+    fn exact_pins_in_manifest_ignores_non_pin_lookalikes() {
+        let manifest = r#"
+[dependencies]
+compatible = "1.2.3"
+range = ">=1, <2"
+feature-text = { version = "1", features = ["=not-a-version"] }
+registry-inline = { version = "1", registry = "=not-a-version" }
+# commented-out = "=9.9.9"
+
+[dependencies.legit-subtable]
+version = "1.2.3"
+features = ["=not-a-version"]
+registry = "=not-a-version"
+# version = '=9.9.9'
+
+[features]
+looks-like-pin = ["=1.2.3"]
+comment-text = ["version = '=9.9.9'"]
+"#;
+
+        assert!(exact_pins_in_manifest(manifest).is_empty());
+    }
+
+    #[test]
+    fn exact_pins_in_manifest_normalizes_toml_string_encodings() {
+        let manifest = r#"
+[dependencies]
+escaped-basic = "\u003d1.2.3"
+multiline-basic = """=1.2.3"""
+multiline-literal = '''=3.4.5'''
+multiline-compatible = """4.5.6"""
+"#;
+
+        assert_eq!(
+            exact_pins_in_manifest(manifest),
+            ["escaped-basic", "multiline-basic", "multiline-literal"]
+        );
+    }
+
     #[test]
     fn default_timeout_register_unset_preserves_command_timeout_default() {
         let register = DefaultTimeoutRegister::default();
